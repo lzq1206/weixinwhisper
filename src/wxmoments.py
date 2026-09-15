@@ -198,6 +198,14 @@ def clean_account_name(path_name: str) -> str:
 
 
 def default_wechat_roots() -> list[Path]:
+    """Return likely WeChat data roots without scanning whole disks.
+
+    The previous implementation called the broad auto detector here.  That
+    detector inspected every mounted drive before the exporter had even
+    checked the standard WeChat locations, which made the GUI appear stuck at
+    account detection.  The broad detector is now only used as a bounded
+    fallback by :func:`find_account`.
+    """
     roots: list[Path] = []
     configured = os.environ.get("WXMOMENTS_WECHAT_DATA_ROOT", "")
     if configured:
@@ -205,19 +213,27 @@ def default_wechat_roots() -> list[Path]:
             if item.strip():
                 roots.append(Path(item.strip()).expanduser())
 
-    try:
-        from wechat_decrypt_tool.modules.wechat_detection import auto_detect_wechat_data_dirs
-
-        roots.extend(Path(item).expanduser() for item in auto_detect_wechat_data_dirs())
-    except Exception as exc:
-        print(f"[warning] {exc}", file=sys.stderr)
-
-    for raw in (
-        Path.home() / "xwechat_files",
-        Path.home() / "Documents" / "xwechat_files",
-        Path.home() / "Documents" / "WeChat Files",
-        Path.home() / "Documents" / "Weixin Files",
-    ):
+    home = Path.home()
+    profile = Path(os.environ.get("USERPROFILE", "") or home)
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", "") or profile / "AppData" / "Local")
+    roaming_app_data = Path(os.environ.get("APPDATA", "") or profile / "AppData" / "Roaming")
+    raw_roots = (
+        home / "xwechat_files",
+        home / "Documents" / "xwechat_files",
+        home / "Documents" / "WeChat Files",
+        home / "Documents" / "Weixin Files",
+        profile / "xwechat_files",
+        profile / "Documents" / "xwechat_files",
+        profile / "Documents" / "WeChat Files",
+        profile / "Documents" / "Weixin Files",
+        local_app_data / "xwechat_files",
+        roaming_app_data / "xwechat_files",
+        local_app_data / "Tencent" / "WeChat",
+        roaming_app_data / "Tencent" / "WeChat",
+        local_app_data / "WeChat Files",
+        roaming_app_data / "WeChat Files",
+    )
+    for raw in raw_roots:
         text = str(raw or "").strip()
         if text:
             roots.append(Path(text).expanduser())
@@ -255,7 +271,12 @@ _ACCOUNT_SCAN_SKIP_NAMES = {
 }
 
 
-def _iter_sns_db_paths(root: Path, *, max_depth: int = 6) -> list[Path]:
+def _iter_sns_db_paths(
+    root: Path,
+    *,
+    max_depth: int = 6,
+    stop_event: Any = None,
+) -> list[Path]:
     root = root.expanduser()
     found: list[Path] = []
     if not root.exists():
@@ -264,6 +285,8 @@ def _iter_sns_db_paths(root: Path, *, max_depth: int = 6) -> list[Path]:
     stack: list[tuple[Path, int]] = [(root, 0)]
     seen: set[str] = set()
     while stack:
+        if stop_event is not None and stop_event.is_set():
+            raise ExportCancelled("用户已停止导出")
         current, depth = stack.pop()
         try:
             key = os.path.normcase(str(current.resolve()))
@@ -329,16 +352,27 @@ def _account_from_sns_db_path(sns_path: Path, account_hint: str = "") -> Account
     return AccountInfo(account=account, wxid_dir=wxid_dir, db_storage_dir=db_dir)
 
 
-def iter_account_candidates(root: Path, account_hint: str = "") -> list[AccountInfo]:
+def iter_account_candidates(
+    root: Path,
+    account_hint: str = "",
+    *,
+    stop_event: Any = None,
+) -> list[AccountInfo]:
     candidates: list[AccountInfo] = []
     if not root.exists():
         return candidates
     roots = [root]
     try:
-        roots.extend([p for p in root.iterdir() if p.is_dir() and p.name.lower().startswith("wxid_")])
+        # Newer WeChat versions use account folder names such as
+        # ``lzq1206_528a`` instead of ``wxid_*``.  Looking at the immediate
+        # children and checking for db_storage is both more accurate and much
+        # faster than recursively searching the entire data tree.
+        roots.extend([p for p in root.iterdir() if p.is_dir()])
     except Exception as exc:
         print(f"[warning] {exc}", file=sys.stderr)
     for wxid_dir in roots:
+        if stop_event is not None and stop_event.is_set():
+            raise ExportCancelled("用户已停止导出")
         db_dir = wxid_dir / "db_storage"
         sns = db_dir / "sns" / "sns.db"
         if not sns.exists():
@@ -350,7 +384,13 @@ def iter_account_candidates(root: Path, account_hint: str = "") -> list[AccountI
             continue
         candidates.append(AccountInfo(account=account, wxid_dir=wxid_dir, db_storage_dir=db_dir))
 
-    for sns_path in _iter_sns_db_paths(root):
+    # In the normal layout the account directory is directly below the data
+    # root.  Once found, do not recursively walk the entire WeChat media
+    # directory just to discover the same account a second time.
+    if candidates:
+        return candidates
+
+    for sns_path in _iter_sns_db_paths(root, stop_event=stop_event):
         item = _account_from_sns_db_path(sns_path, account_hint)
         if item is not None:
             candidates.append(item)
@@ -368,7 +408,7 @@ def iter_account_candidates(root: Path, account_hint: str = "") -> list[AccountI
     return uniq
 
 
-def find_account(config: dict[str, Any]) -> AccountInfo:
+def find_account(config: dict[str, Any], *, stop_event: Any = None) -> AccountInfo:
     account_hint = str(config.get("account") or "").strip()
     configured_root = str(config.get("wechat_data_root") or "").strip()
     roots = [
@@ -378,7 +418,9 @@ def find_account(config: dict[str, Any]) -> AccountInfo:
     ] if configured_root else default_wechat_roots()
     candidates: list[tuple[int, AccountInfo]] = []
     for root in roots:
-        for item in iter_account_candidates(root, account_hint):
+        if stop_event is not None and stop_event.is_set():
+            raise ExportCancelled("用户已停止导出")
+        for item in iter_account_candidates(root, account_hint, stop_event=stop_event):
             sns_path = item.db_storage_dir / "sns" / "sns.db"
             if not sns_path.exists():
                 sns_path = item.db_storage_dir / "sns.db"
@@ -387,6 +429,30 @@ def find_account(config: dict[str, Any]) -> AccountInfo:
             except OSError:
                 size = 0
             candidates.append((size, item))
+
+    # Only use the compatibility detector after the standard locations fail.
+    # It is intentionally kept out of default_wechat_roots(), because calling
+    # it on every export used to trigger a slow whole-disk scan.
+    if not candidates and not configured_root:
+        try:
+            from wechat_decrypt_tool.modules.wechat_detection import auto_detect_wechat_data_dirs
+
+            for detected in auto_detect_wechat_data_dirs():
+                if stop_event is not None and stop_event.is_set():
+                    raise ExportCancelled("用户已停止导出")
+                for item in iter_account_candidates(Path(detected), account_hint, stop_event=stop_event):
+                    sns_path = item.db_storage_dir / "sns" / "sns.db"
+                    if not sns_path.exists():
+                        sns_path = item.db_storage_dir / "sns.db"
+                    try:
+                        size = int(sns_path.stat().st_size)
+                    except OSError:
+                        size = 0
+                    candidates.append((size, item))
+        except ExportCancelled:
+            raise
+        except Exception as exc:
+            print(f"[warning] 兼容自动检测失败：{exc}", file=sys.stderr)
     if not candidates:
         searched = "、".join(str(p) for p in roots)
         raise FileNotFoundError(

@@ -352,8 +352,9 @@ class ExportApp:
         config["db_key"] = ""
         wxmoments.save_config(wxmoments.DEFAULT_CONFIG, config)
 
-        self.events.put(("log", "正在自动定位微信账号…"))
-        account = wxmoments.find_account(config)
+        self.events.put(("log", "正在自动定位微信账号（优先检查标准目录）…"))
+        account = wxmoments.find_account(config, stop_event=self.export_stop)
+        self.events.put(("log", f"已定位微信账号：{account.account}"))
         self._check_export_stop()
         key = wxmoments.load_saved_db_key(account)
         if not key:

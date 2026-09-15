@@ -208,6 +208,14 @@ def _contains_wechat_accounts_within(path: Path, *, depth: int) -> bool:
 
 
 def _build_auto_detect_scan_paths() -> list[str]:
+    """Build a small set of likely paths for the compatibility detector.
+
+    This function used to add every mounted drive, every drive-root child and
+    every user directory.  The resulting recursive directory checks could
+    take minutes on machines with large or network-backed volumes.  Standard
+    WeChat locations cover the normal installation, while the explicit
+    fallback paths below preserve support for common custom locations.
+    """
     scan_paths: list[str] = []
     seen: set[str] = set()
 
@@ -222,49 +230,40 @@ def _build_auto_detect_scan_paths() -> list[str]:
             scan_paths.append(normalized)
 
     home_dir = Path.home()
-    for item in (home_dir, home_dir / "Documents", home_dir / "Desktop", home_dir / "Downloads"):
-        add(item)
-
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        profile = Path(user_profile)
-        for item in (profile, profile / "Documents", profile / "Desktop", profile / "Downloads"):
+    profile = Path(os.environ.get("USERPROFILE", "") or home_dir)
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", "") or profile / "AppData" / "Local")
+    roaming_app_data = Path(os.environ.get("APPDATA", "") or profile / "AppData" / "Roaming")
+    for base in (home_dir, profile):
+        for item in (
+            base / "xwechat_files",
+            base / "Documents" / "xwechat_files",
+            base / "Documents" / "WeChat Files",
+            base / "Documents" / "Weixin Files",
+            base / "WeChat Files",
+            base / "Weixin Files",
+        ):
+            add(item)
+    for base in (local_app_data, roaming_app_data):
+        for item in (
+            base / "xwechat_files",
+            base / "Tencent" / "WeChat",
+            base / "WeChat Files",
+        ):
             add(item)
 
-    drives: list[Path] = []
-    try:
-        partitions = psutil.disk_partitions(all=False)
-        for part in partitions:
-            mount = str(part.mountpoint or "").strip()
-            if mount:
-                drives.append(Path(mount))
-    except Exception:
-        pass
-
-    if not drives:
-        for drive_letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-            drive_root = Path(f"{drive_letter}:{os.sep}")
-            if drive_root.exists():
-                drives.append(drive_root)
-
-    for drive_root in drives:
-        add(drive_root)
-        users_dir = drive_root / "Users"
-        add(users_dir)
-        for child_name, child_path in _safe_iter_subdirs(drive_root):
-            if child_name.strip().lower() not in SYSTEM_SCAN_SKIP_NAMES:
+    # Check the current user's normal profile locations for a custom folder
+    # whose name clearly identifies it as WeChat data.  This is one level deep
+    # and never traverses arbitrary drive roots.
+    for base in (home_dir, profile, profile / "Documents", profile / "Desktop", profile / "Downloads"):
+        for child_name, child_path in _safe_iter_subdirs(base):
+            if _is_wechat_dir_candidate_name(child_name):
                 add(child_path)
-        for _user_name, user_dir in _safe_iter_subdirs(users_dir):
-            user_path = Path(user_dir)
-            for item in (user_path, user_path / "Documents", user_path / "Desktop", user_path / "Downloads", user_path / "OneDrive"):
-                add(item)
 
     return scan_paths
 
 
 def auto_detect_wechat_data_dirs() -> list[str]:
     detected_dirs: list[str] = []
-    common_user_roots = {"documents", "desktop", "downloads", "onedrive"}
 
     for scan_path in _build_auto_detect_scan_paths():
         path = Path(scan_path)
@@ -272,19 +271,13 @@ def auto_detect_wechat_data_dirs() -> list[str]:
             continue
 
         path_name = path.name.strip().lower()
-        if (
-            (_is_wechat_dir_candidate_name(path_name) or path_name in common_user_roots)
-            and _contains_wechat_accounts_within(path, depth=3)
-        ):
+        if _is_wechat_dir_candidate_name(path_name) and _contains_wechat_accounts_within(path, depth=2):
             _append_unique(detected_dirs, path)
             continue
 
         for item_name, item_path in _safe_iter_subdirs(path):
             item = Path(item_path)
-            if _contains_wechat_accounts_within(item, depth=2) and (
-                _is_wechat_dir_candidate_name(item_name)
-                or item_name.strip().lower() in common_user_roots
-            ):
+            if _is_wechat_dir_candidate_name(item_name) and _contains_wechat_accounts_within(item, depth=2):
                 _append_unique(detected_dirs, item)
 
     return detected_dirs
