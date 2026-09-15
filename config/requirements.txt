@@ -1,0 +1,14 @@
+cryptography
+httpx
+pefile
+pillow
+psutil
+pycryptodome
+pymem; platform_system == "Windows"
+pywin32; platform_system == "Windows"
+reportlab
+pypdf
+pypdfium2
+requests
+yara-python; platform_system == "Windows"
+zstandard
