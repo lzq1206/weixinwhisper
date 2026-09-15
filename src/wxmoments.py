@@ -16,7 +16,7 @@ from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 PACKAGE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 PROJECT_ROOT = PACKAGE_ROOT
@@ -1548,6 +1548,7 @@ async def export_markdown(
     max_posts: int = 0,
     order: str = "newest",
     stop_event: Any | None = None,
+    progress_callback: Callable[[int, int, str, str], None] | None = None,
 ) -> tuple[dict[str, Any], list[ExportedPost]]:
     figure = output / "figure"
     figure.mkdir(parents=True, exist_ok=True)
@@ -1680,6 +1681,8 @@ async def export_markdown(
                 video_cover_count=post_video_cover_count,
             )
         )
+        if progress_callback is not None:
+            progress_callback(idx, total, time_text, display)
         print(f"  ({idx}/{total}) {time_text} {display}", flush=True)
     (output / "moments.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return stats, exported_posts

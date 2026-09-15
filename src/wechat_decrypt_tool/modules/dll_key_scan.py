@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -114,16 +115,30 @@ def extract_xor_keys_from_dll(
 
     worker_count = max(1, int(max_workers or multiprocessing.cpu_count()))
     worker_count = min(worker_count, len(tasks))
+    # A PyInstaller GUI executable must not let a spawned worker execute the
+    # GUI entry point again.  The GUI caller therefore uses one process; the
+    # explicit guard here also protects other frozen callers.
+    if getattr(sys, "frozen", False):
+        worker_count = 1
     found_matches: list[dict[str, Any]] = []
 
     if worker_count == 1:
         for task in tasks:
             found_matches.extend(worker_search(task))
     else:
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(worker_search, task) for task in tasks]
-            for future in as_completed(futures):
-                found_matches.extend(future.result())
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(worker_search, task) for task in tasks]
+                for future in as_completed(futures):
+                    found_matches.extend(future.result())
+        except Exception:
+            # DLL scanning is a small one-time preprocessing step.  If a
+            # worker cannot be created (common in restricted/frozen Windows
+            # environments), retry safely in the current process instead of
+            # passing a misleading process-pool error to key acquisition.
+            found_matches = []
+            for task in tasks:
+                found_matches.extend(worker_search(task))
 
     found_matches.sort(key=lambda item: int(str(item.get("va") or "0"), 16))
     return found_matches

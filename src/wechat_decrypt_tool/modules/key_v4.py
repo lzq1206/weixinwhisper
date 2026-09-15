@@ -3,6 +3,7 @@ import multiprocessing
 import struct
 import hmac
 import os
+import sys
 from ctypes import wintypes
 
 from Crypto.Protocol.KDF import PBKDF2
@@ -272,11 +273,18 @@ def get_key(pid, process_handle, buf, internal_db_key=None):
         return (lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
 
     keys = []
-    pool = multiprocessing.Pool(processes=multiprocessing.cpu_count() // 2)
-    results = pool.starmap(get_key_inner, ((pid, process_info_) for process_info_ in
-                                           split_list(process_infos, min(len(process_infos), _MAX_PROCESS_SPLITS))))
-    pool.close()
-    pool.join()
+    chunks = list(split_list(process_infos, min(len(process_infos), _MAX_PROCESS_SPLITS))) if process_infos else []
+    worker_count = max(1, multiprocessing.cpu_count() // 2)
+    if getattr(sys, "frozen", False):
+        # A frozen GUI must not create child processes that can re-enter the
+        # graphical entry point.  The scan remains correct in one process and
+        # avoids the duplicate-window/process-pool failure on Windows.
+        worker_count = 1
+    if worker_count == 1:
+        results = [get_key_inner(pid, process_info_) for process_info_ in chunks]
+    else:
+        with multiprocessing.Pool(processes=worker_count) as pool:
+            results = pool.starmap(get_key_inner, ((pid, process_info_) for process_info_ in chunks))
 
     raw_keys = []
     for r in results:
@@ -301,23 +309,37 @@ def verify_keys(keys, buf, internal_db_key=None):
         return None
 
     worker_count = max(1, multiprocessing.cpu_count() // 2)
+    if getattr(sys, "frozen", False):
+        worker_count = 1
     _debug(f"[*] Testing {total} filtered key candidates with {worker_count} workers...")
 
     completed = 0
     last_percent = -1
-    with multiprocessing.Pool(processes=worker_count) as pool:
-        task_iter = ((key, buf, internal_db_key) for key in keys)
-        for r in pool.imap_unordered(verify_worker, task_iter, chunksize=_VERIFY_CHUNK_SIZE):
+    task_iter = ((key, buf, internal_db_key) for key in keys)
+    if worker_count == 1:
+        results_iter = (verify_worker(task) for task in task_iter)
+        for r in results_iter:
             completed += 1
             percent = int((completed / total) * 100)
             if percent != last_percent:
                 _debug(f"[*] Verify progress: {completed}/{total} ({percent}%)")
                 last_percent = percent
-
             if r:
                 _debug(f"[+] Key found (length={len(r)} bytes; value redacted)")
-                pool.terminate()
                 return bytes.hex(r)
+    else:
+        with multiprocessing.Pool(processes=worker_count) as pool:
+            for r in pool.imap_unordered(verify_worker, task_iter, chunksize=_VERIFY_CHUNK_SIZE):
+                completed += 1
+                percent = int((completed / total) * 100)
+                if percent != last_percent:
+                    _debug(f"[*] Verify progress: {completed}/{total} ({percent}%)")
+                    last_percent = percent
+
+                if r:
+                    _debug(f"[+] Key found (length={len(r)} bytes; value redacted)")
+                    pool.terminate()
+                    return bytes.hex(r)
 
     _debug("[-] Verification completed, no valid key")
     return None

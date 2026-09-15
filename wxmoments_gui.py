@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import html
 import json
+import multiprocessing
 import os
 import queue
 import re
@@ -16,7 +17,7 @@ from tkinter import BooleanVar, END, StringVar, Tk, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 
-APP_NAME = "wxMoments 微信朋友圈导出"
+APP_NAME = "微信朋友圈导出工具1.0"
 PROJECT_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 SRC_ROOT = PROJECT_ROOT / "src"
 if SRC_ROOT.exists():
@@ -115,8 +116,12 @@ class ExportApp:
         self.allow_download_var = BooleanVar(value=False)
         self.refresh_interval_var = StringVar(value="1.0")
         self.refresh_status_var = StringVar(value="未启动")
+        self.phase_var = StringVar(value="当前阶段：准备就绪")
         self.status_var = StringVar(value="准备就绪")
-        self.progress = ttk.Progressbar(root, mode="indeterminate")
+        self.progress_text_var = StringVar(value="0%")
+        self.latest_var = StringVar(value="最新导出：暂无")
+        ttk.Style(root).configure("Export.Horizontal.TProgressbar", thickness=18)
+        self.progress: ttk.Progressbar | None = None
 
         self._build_ui()
         self.root.after(150, self._drain_events)
@@ -124,7 +129,7 @@ class ExportApp:
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="微信朋友圈导出", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(outer, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
         ttk.Label(outer, text="按年份独立导出 HTML，照片可点击打开。请先在电脑版微信中加载需要的朋友圈缓存。", foreground="#555").pack(anchor="w", pady=(5, 18))
 
         form = ttk.Frame(outer)
@@ -165,8 +170,22 @@ class ExportApp:
         self.stop_export_button.pack(side="left", padx=(10, 0))
         self.open_button = ttk.Button(action, text="打开上次输出目录", command=self.open_last_output, state="disabled")
         self.open_button.pack(side="left", padx=10)
-        self.progress.pack(fill="x", pady=(0, 8))
-        ttk.Label(outer, textvariable=self.status_var, foreground="#1769aa").pack(anchor="w")
+        progress_frame = ttk.Frame(outer)
+        progress_frame.pack(fill="x", pady=(0, 6))
+        self.progress = ttk.Progressbar(
+            progress_frame,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            value=0,
+            length=640,
+            style="Export.Horizontal.TProgressbar",
+        )
+        self.progress.pack(side="left", fill="x", expand=True, ipady=3)
+        ttk.Label(progress_frame, textvariable=self.progress_text_var, width=7, anchor="e").pack(side="right", padx=(10, 0))
+        ttk.Label(outer, textvariable=self.phase_var, foreground="#1769aa", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(outer, textvariable=self.status_var, foreground="#1769aa").pack(anchor="w", pady=(2, 0))
+        ttk.Label(outer, textvariable=self.latest_var, foreground="#555", wraplength=700).pack(anchor="w", pady=(2, 0))
 
         log_frame = ttk.LabelFrame(outer, text="运行日志", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(12, 0))
@@ -320,7 +339,11 @@ class ExportApp:
         self.start_button.configure(state="disabled")
         self.stop_export_button.configure(state="normal")
         self.open_button.configure(state="disabled")
-        self.progress.start(12)
+        self.progress.configure(value=0)
+        self.progress_text_var.set("0%")
+        self.phase_var.set("当前阶段：准备导出")
+        self.status_var.set("正在准备导出…")
+        self.latest_var.set("最新导出：暂无")
         self._append_log("开始导出，请保持微信登录；大型年份可能需要几分钟。")
         self.worker = threading.Thread(target=self._worker_main, args=(first, last), daemon=True)
         self.worker.start()
@@ -328,6 +351,7 @@ class ExportApp:
     def stop_export(self) -> None:
         if self.worker and self.worker.is_alive():
             self.export_stop.set()
+            self.phase_var.set("当前阶段：正在停止")
             self.status_var.set("正在停止导出…")
             self._append_log("已请求停止导出，程序会在当前图片处理完成后停止。")
 
@@ -352,20 +376,33 @@ class ExportApp:
         config["db_key"] = ""
         wxmoments.save_config(wxmoments.DEFAULT_CONFIG, config)
 
+        self.events.put(("phase", "当前阶段：查找微信账号"))
+        self.events.put(("progress", {"value": 2, "status": "正在检查微信数据目录…"}))
         self.events.put(("log", "正在自动定位微信账号（优先检查标准目录）…"))
         account = wxmoments.find_account(config, stop_event=self.export_stop)
         self.events.put(("log", f"已定位微信账号：{account.account}"))
+        self.events.put(("progress", {"value": 5, "status": f"已找到微信账号：{account.account}"}))
         self._check_export_stop()
         key = wxmoments.load_saved_db_key(account)
         if not key:
+            self.events.put(("phase", "当前阶段：获取数据库密钥"))
+            self.events.put(("progress", {"value": 8, "status": "正在获取数据库密钥，请保持微信登录…"}))
             self.events.put(("log", "正在自动获取数据库密钥…"))
             from wechat_decrypt_tool.modules.key_service import get_db_key_workflow
 
-            result = get_db_key_workflow(db_storage_path=str(account.db_storage_dir))
+            try:
+                result = get_db_key_workflow(db_storage_path=str(account.db_storage_dir))
+            except Exception as exc:
+                raise RuntimeError(
+                    "自动获取数据库密钥失败。请保持电脑版微信已登录，并关闭其他微信窗口后重试。\n"
+                    f"详细原因：{exc}"
+                ) from exc
             key = str(result.get("db_key") or "").strip()
         if not re.fullmatch(r"[0-9a-fA-F]{64}", key):
             raise ValueError("数据库密钥无效，请粘贴 64 位十六进制密钥。")
 
+        self.events.put(("phase", "当前阶段：解密微信数据库"))
+        self.events.put(("progress", {"value": 12, "status": "正在解密微信数据库…"}))
         self.events.put(("log", "正在解密数据库…"))
         account_dir = wxmoments.decrypt_databases(account, key)
         self._check_export_stop()
@@ -374,6 +411,8 @@ class ExportApp:
         wxmoments.write_contact_cache(account_dir, contacts)
         names = wxmoments.build_contact_display_names(contacts)
         usernames = wxmoments.self_username_candidates(account, config) if self.only_self_var.get() else None
+        self.events.put(("progress", {"value": 17, "status": "数据库解密完成，正在准备图片密钥…"}))
+        self.events.put(("phase", "当前阶段：准备图片密钥"))
         self.events.put(("log", "正在准备图片密钥…"))
         await wxmoments.save_image_keys(account.account, account.wxid_dir, account.db_storage_dir)
         self._check_export_stop()
@@ -383,14 +422,32 @@ class ExportApp:
         output.mkdir(parents=True, exist_ok=True)
         self.current_output = output
         rows: list[dict[str, object]] = []
-        for year in range(first, last + 1):
+        year_count = max(1, last - first + 1)
+        export_base = 20.0
+        export_span = 78.0
+        for year_index, year in enumerate(range(first, last + 1)):
             if self.export_stop.is_set():
                 raise wxmoments.ExportCancelled("用户已停止导出")
             year_dir = output / str(year)
             year_dir.mkdir(parents=True, exist_ok=True)
-            self.events.put(("status", f"正在导出 {year} 年…"))
+            self.events.put(("phase", "当前阶段：导出朋友圈"))
+            year_start_percent = export_base + export_span * year_index / year_count
+            self.events.put(("progress", {"value": year_start_percent, "status": f"正在读取 {year} 年朋友圈数据…"}))
             start = wxmoments.parse_datetime(f"{year}-01-01", end_of_day=False)
             end = wxmoments.parse_datetime(f"{year}-12-31", end_of_day=True)
+
+            def on_post_progress(index: int, total: int, time_text: str, display: str, *, _year=year, _index=year_index) -> None:
+                ratio = index / max(1, total)
+                percent = export_base + export_span * (_index + ratio) / year_count
+                self.events.put((
+                    "progress",
+                    {
+                        "value": percent,
+                        "status": f"正在导出 {_year} 年：第 {index}/{total} 条",
+                        "latest": f"最新导出：{display}　{time_text}",
+                    },
+                ))
+
             with (year_dir / "export.log").open("w", encoding="utf-8") as log, contextlib.redirect_stdout(log):
                 stats, posts = await wxmoments.export_markdown(
                     account,
@@ -406,18 +463,28 @@ class ExportApp:
                     max_posts=0,
                     order="oldest",
                     stop_event=self.export_stop,
+                    progress_callback=on_post_progress,
                 )
             html_path = wxmoments.write_pdf_html(year_dir, posts, filename=f"朋友圈_{year}.html")
             clickable = make_photos_clickable(html_path)
             row = {"year": year, "html": str(html_path), "clickable_photos": clickable, **stats}
             rows.append(row)
             self.events.put(("log", f"{year} 年完成：{stats['posts']} 条朋友圈，{clickable} 张可点击照片"))
+            self.events.put((
+                "progress",
+                {
+                    "value": export_base + export_span * (year_index + 1) / year_count,
+                    "status": f"{year} 年导出完成：{stats['posts']} 条朋友圈",
+                },
+            ))
             (output / "年度统计.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
             make_index(output, rows)
 
         (output / "年度统计.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
         index = make_index(output, rows)
         self.events.put(("log", f"年度索引已生成：{index}"))
+        self.events.put(("phase", "当前阶段：导出完成"))
+        self.events.put(("progress", {"value": 100, "status": "全部年度导出完成"}))
         return output
 
     def _drain_events(self) -> None:
@@ -426,10 +493,24 @@ class ExportApp:
                 kind, value = self.events.get_nowait()
                 if kind == "log":
                     self._append_log(str(value))
+                elif kind == "phase":
+                    self.phase_var.set(str(value))
                 elif kind == "status":
                     self.status_var.set(str(value))
+                elif kind == "progress":
+                    payload = value if isinstance(value, dict) else {"value": 0, "status": str(value)}
+                    percent = max(0.0, min(100.0, float(payload.get("value") or 0)))
+                    self.progress.configure(value=percent)
+                    self.progress_text_var.set(f"{percent:.0f}%")
+                    if payload.get("status"):
+                        self.status_var.set(str(payload["status"]))
+                    if payload.get("latest"):
+                        self.latest_var.set(str(payload["latest"]))
                 elif kind == "done":
                     output = Path(str(value))
+                    self.phase_var.set("当前阶段：导出完成")
+                    self.progress.configure(value=100)
+                    self.progress_text_var.set("100%")
                     self.status_var.set("导出完成")
                     self._append_log(f"全部完成：{output}")
                     self.last_output = output
@@ -437,6 +518,7 @@ class ExportApp:
                     self.stop_export_button.configure(state="disabled")
                     messagebox.showinfo("导出完成", f"年度索引已生成：\n{output / '年度索引.html'}")
                 elif kind == "cancelled":
+                    self.phase_var.set("当前阶段：已停止")
                     self.status_var.set("已停止导出")
                     self._append_log(f"导出已停止：{value}")
                     if self.current_output and self.current_output.exists():
@@ -444,6 +526,7 @@ class ExportApp:
                         self.open_button.configure(state="normal")
                     self.stop_export_button.configure(state="disabled")
                 elif kind == "error":
+                    self.phase_var.set("当前阶段：发生错误")
                     self.status_var.set("导出失败")
                     self._append_log(f"错误：{value}")
                     self.stop_export_button.configure(state="disabled")
@@ -465,7 +548,6 @@ class ExportApp:
         except queue.Empty:
             pass
         if not (self.worker and self.worker.is_alive()):
-            self.progress.stop()
             self.start_button.configure(state="normal")
         self.root.after(150, self._drain_events)
 
@@ -476,6 +558,7 @@ class ExportApp:
 
 
 def main() -> int:
+    multiprocessing.freeze_support()
     root = Tk()
     root.state("normal")
     root.deiconify()
