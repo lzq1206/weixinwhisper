@@ -9,7 +9,15 @@ project = Path(SPECPATH)
 sys.path.insert(0, str(project / "src"))
 pkg_datas = collect_data_files("wechat_decrypt_tool")
 pkg_binaries = collect_dynamic_libs("wechat_decrypt_tool")
-pkg_hiddenimports = collect_submodules("wechat_decrypt_tool")
+pkg_hiddenimports = sorted(set(collect_submodules("wechat_decrypt_tool")))
+# These modules are imported dynamically by the automatic key workflow and
+# must be present in the frozen EXE even when PyInstaller cannot infer them.
+pkg_hiddenimports.extend([
+    "wechat_decrypt_tool.modules.key_service",
+    "wechat_decrypt_tool.modules.key_v4",
+    "wechat_decrypt_tool.modules.dll_key_scan",
+    "wechat_decrypt_tool.modules.image_key_memory_scan",
+])
 datas = list(pkg_datas)
 datas.append((str(project / "config" / "config.json"), "config"))
 

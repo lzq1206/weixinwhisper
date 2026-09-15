@@ -384,7 +384,9 @@ class ExportApp:
         self.events.put(("progress", {"value": 5, "status": f"已找到微信账号：{account.account}"}))
         self._check_export_stop()
         key = wxmoments.load_saved_db_key(account)
-        if not key:
+        if key:
+            self.events.put(("log", "已找到本地保存的数据库密钥，跳过内存扫描。"))
+        else:
             self.events.put(("phase", "当前阶段：获取数据库密钥"))
             self.events.put(("progress", {"value": 8, "status": "正在获取数据库密钥，请保持微信登录…"}))
             self.events.put(("log", "正在自动获取数据库密钥…"))
