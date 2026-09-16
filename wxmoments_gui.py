@@ -17,7 +17,7 @@ from tkinter import BooleanVar, END, StringVar, Tk, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 
-APP_NAME = "微信朋友圈导出工具1.0"
+APP_NAME = "微信朋友圈导出工具1.01"
 PROJECT_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 SRC_ROOT = PROJECT_ROOT / "src"
 if SRC_ROOT.exists():
@@ -107,8 +107,14 @@ class ExportApp:
         default_output = str(Path.home() / "Desktop" / "朋友圈导出")
         if not Path(default_output).parent.exists():
             default_output = str(Path.home() / "朋友圈导出")
+        saved_manual_root = str(config.get("wechat_data_root") or "").strip()
+        saved_manual_path = Path(saved_manual_root).expanduser() if saved_manual_root else None
 
         self.output_var = StringVar(value=default_output)
+        self.manual_data_enabled_var = BooleanVar(
+            value=bool(saved_manual_path and saved_manual_path.is_dir())
+        )
+        self.manual_data_root_var = StringVar(value=saved_manual_root)
         self.first_year_var = StringVar(value="2012")
         self.last_year_var = StringVar(value=str(datetime.now().year))
         self.only_self_var = BooleanVar(value=True)
@@ -135,11 +141,25 @@ class ExportApp:
         form = ttk.Frame(outer)
         form.pack(fill="x")
         self._path_row(form, 0, "输出目录", self.output_var, self._choose_output)
-        ttk.Label(form, text="微信数据目录和数据库密钥将在导出时自动定位和获取", foreground="#777").grid(row=1, column=1, columnspan=3, sticky="w", pady=(0, 7))
+        ttk.Checkbutton(
+            form,
+            text="使用手动 xwechat_files 目录",
+            variable=self.manual_data_enabled_var,
+            command=self._toggle_manual_data,
+        ).grid(row=1, column=0, sticky="w", pady=7)
+        self.manual_data_entry = ttk.Entry(form, textvariable=self.manual_data_root_var)
+        self.manual_data_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=7)
+        self.manual_data_button = ttk.Button(form, text="选择目录…", command=self._choose_wechat_data)
+        self.manual_data_button.grid(row=1, column=3, padx=(8, 0), pady=7)
+        ttk.Label(
+            form,
+            text="勾选后选择微信的 xwechat_files 目录；未勾选、目录不存在或找不到账号时会使用自动快速检索。",
+            foreground="#777",
+        ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(0, 7))
 
-        ttk.Label(form, text="年份范围").grid(row=2, column=0, sticky="w", pady=7)
+        ttk.Label(form, text="年份范围").grid(row=3, column=0, sticky="w", pady=7)
         year_frame = ttk.Frame(form)
-        year_frame.grid(row=2, column=1, sticky="w", pady=7)
+        year_frame.grid(row=3, column=1, sticky="w", pady=7)
         ttk.Entry(year_frame, width=8, textvariable=self.first_year_var).pack(side="left")
         ttk.Label(year_frame, text="  至  ").pack(side="left")
         ttk.Entry(year_frame, width=8, textvariable=self.last_year_var).pack(side="left")
@@ -194,6 +214,7 @@ class ExportApp:
 
         for column in (1, 2):
             form.columnconfigure(column, weight=1)
+        self._toggle_manual_data()
 
     def _path_row(self, parent: ttk.Frame, row: int, label: str, variable: StringVar, command) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=7)
@@ -204,6 +225,22 @@ class ExportApp:
         chosen = filedialog.askdirectory(title="选择输出目录")
         if chosen:
             self.output_var.set(chosen)
+
+    def _toggle_manual_data(self) -> None:
+        state = "normal" if self.manual_data_enabled_var.get() else "disabled"
+        self.manual_data_entry.configure(state=state)
+        self.manual_data_button.configure(state=state)
+
+    def _choose_wechat_data(self) -> None:
+        current = Path(self.manual_data_root_var.get().strip()).expanduser()
+        options = {"title": "选择微信 xwechat_files 数据目录", "mustexist": True}
+        if current.is_dir():
+            options["initialdir"] = str(current)
+        chosen = filedialog.askdirectory(**options)
+        if chosen:
+            self.manual_data_root_var.set(chosen)
+            self.manual_data_enabled_var.set(True)
+            self._toggle_manual_data()
 
     def _wechat_window(self):
         if not all((win32api, win32con, win32gui, win32process)):
@@ -359,6 +396,18 @@ class ExportApp:
         if self.export_stop.is_set():
             raise wxmoments.ExportCancelled("用户已停止导出")
 
+    def _find_account_for_export(self, config: dict[str, object], manual_root: str):
+        try:
+            return wxmoments.find_account(config, stop_event=self.export_stop)
+        except FileNotFoundError:
+            if not manual_root:
+                raise
+            config["wechat_data_root"] = ""
+            wxmoments.save_config(wxmoments.DEFAULT_CONFIG, config)
+            self.events.put(("log", "手动 xwechat_files 目录中未找到有效微信账号，已回退自动快速检索。"))
+            self.events.put(("progress", {"value": 2, "status": "手动目录未找到账号，正在自动快速检索…"}))
+            return wxmoments.find_account(config, stop_event=self.export_stop)
+
     def _worker_main(self, first: int, last: int) -> None:
         try:
             output = asyncio.run(self._export(first, last))
@@ -374,12 +423,28 @@ class ExportApp:
         config["wechat_data_root"] = ""
         config["account"] = ""
         config["db_key"] = ""
+
+        manual_root = ""
+        if self.manual_data_enabled_var.get():
+            raw_manual_root = self.manual_data_root_var.get().strip()
+            manual_path = Path(raw_manual_root).expanduser() if raw_manual_root else None
+            if manual_path and manual_path.is_dir():
+                manual_root = str(manual_path)
+                config["wechat_data_root"] = manual_root
+                self.events.put(("log", f"已启用手动 xwechat_files 目录：{manual_path}"))
+            else:
+                self.events.put(("log", "手动 xwechat_files 目录不存在或未选择，已回退自动快速检索。"))
+                self.events.put(("progress", {"value": 2, "status": "手动目录无效，正在自动快速检索…"}))
         wxmoments.save_config(wxmoments.DEFAULT_CONFIG, config)
 
         self.events.put(("phase", "当前阶段：查找微信账号"))
-        self.events.put(("progress", {"value": 2, "status": "正在检查微信数据目录…"}))
-        self.events.put(("log", "正在自动定位微信账号（优先检查标准目录）…"))
-        account = wxmoments.find_account(config, stop_event=self.export_stop)
+        if manual_root:
+            self.events.put(("progress", {"value": 2, "status": "正在检查手动 xwechat_files 目录…"}))
+            self.events.put(("log", "正在检查手动 xwechat_files 目录中的微信账号…"))
+        else:
+            self.events.put(("progress", {"value": 2, "status": "正在检查微信数据目录…"}))
+            self.events.put(("log", "正在自动定位微信账号（优先检查标准目录）…"))
+        account = self._find_account_for_export(config, manual_root)
         self.events.put(("log", f"已定位微信账号：{account.account}"))
         self.events.put(("progress", {"value": 5, "status": f"已找到微信账号：{account.account}"}))
         self._check_export_stop()
